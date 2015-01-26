@@ -155,7 +155,7 @@ class VMBuilder:
     >>>         future = executor.submit(["msconvert", "{input}/file.RAW]",
     >>>                                   "-o", "{output}"])
     >>>         retcode, out, err = future.result()
-    >>>         executor.submit(['shutdown', '/p']).wait()
+    >>>         executor.submit(['shutdown', '/t', '3']).wait()
     >>>     vm.copy_out('output', 'output.tar')
     """
     def __init__(self, qemu_bin, root_base_image, workdir, keep_images=False):
@@ -250,11 +250,6 @@ class VMBuilder:
         This socket is used to send commands to the vm and to get back
         status codes.
         """
-        if self._socket:
-            raise ValueError('add_socket was called more than once.')
-        if os.path.exists(socket_file):
-            raise ValueError('Socket file exists: %s' % socket_file)
-        self._socket = socket_file
 
         self.add_option('chardev', 'socket', path=socket_file, id=id_)
         guestfwd = "tcp:{}:{}-chardev:{}".format(host_ip, port, id_)

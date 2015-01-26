@@ -141,9 +141,10 @@ class CommandSendingServer(threading.Thread):
                  ctx=None):
         super().__init__()
         self._context = ctx or zmq.Context()
+        self._num_workers = num_workers
         self._request_socket = self._context.socket(zmq.PUSH)
         self._response_socket = self._context.socket(zmq.PULL)
-        self._request_socket.set(zmq.SNDTIMEO, 1000)
+        self._request_socket.set(zmq.SNDTIMEO, 60000)
         self._request_socket.bind(request_path)
         self._response_socket.bind(response_path)
         self._backend_alive = backend_alive
@@ -156,28 +157,38 @@ class CommandSendingServer(threading.Thread):
         self._request_counter = 0
         self._futures = {}
 
-        self._request_socket.send_json({'type': 'setup',
-                                        'numWorkers': num_workers})
-
     def shutdown(self):
         self._interrupted = True
+        self.wait()
 
     def run(self):
-        poller = zmq.Poller()
-        poller.register(self._response_socket, zmq.POLLIN)
-        while True:
-            if not self._backend_alive() or self._interrupted:
-                logger.info("Shutting down CommandSendingServer")
-                return
-            socks = dict(poller.poll(100))
-            if socks:
-                data = self._response_socket.recv_json(zmq.NOBLOCK)
-                if data['type'] == 'logging':
-                    self._remote_logger.log(data['priority'], data['message'])
-                elif data['type'] == 'commandFinished':
-                    future = self._futures[data['requestID']]
-                    future._out = data
-                    del self._futures[data['requestID']]
+        try:
+            self._request_socket.send_json(
+                {
+                    'type': 'setup',
+                    'numWorkers': self._num_workers
+                }
+            )
+
+            poller = zmq.Poller()
+            poller.register(self._response_socket, zmq.POLLIN)
+            while True:
+                if not self._backend_alive() or self._interrupted:
+                    logger.info("Shutting down CommandSendingServer")
+                    return
+                socks = dict(poller.poll(100))
+                if socks:
+                    data = self._response_socket.recv_json(zmq.NOBLOCK)
+                    if data['type'] == 'logging':
+                        self._remote_logger.log(data['priority'],
+                                                data['message'])
+                    elif data['type'] == 'commandFinished':
+                        future = self._futures[data['requestID']]
+                        future._out = data
+                        del self._futures[data['requestID']]
+        except Exception as e:
+            logger.critical("Exception in server thread: %s" % e)
+            raise
 
     def send_command(self, command):
         if not self.is_alive() or not self._backend_alive():
@@ -196,8 +207,5 @@ class CommandSendingServer(threading.Thread):
             return future
 
     def wait(self):
-        while (self.is_alive() and
-               self._backend_alive() and
-               self._futures):
-            time.sleep(.1)
+        self.join()
         return len(self._futures) == 0

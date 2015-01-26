@@ -1,5 +1,6 @@
 from vmcall.vmcall import *
 from vmcall.vmserve import *
+from vmcall.qemu import *
 import tempfile
 import os
 from os.path import join as pjoin
@@ -106,45 +107,50 @@ class TestCommandSendServer(unittest.TestCase):
             lambda: self._backend_alive,
             2,
         )
-        self.server.start()
 
         def handle():
             request_socket = self.server._context.socket(zmq.PULL)
             response_socket = self.server._context.socket(zmq.PUSH)
+            response_socket.set(zmq.SNDTIMEO, 2000)
+            request_socket.set(zmq.RCVTIMEO, 100)
             request_socket.connect('ipc://' + self.request_socket)
             response_socket.connect('ipc://' + self.response_socket)
             while True:
                 if not self._backend_alive:
                     return
-                request = request_socket.recv_json()
-                if request['type'] == 'exit':
-                    return
-                self.last_request = request
-                response_socket.send_json({'requestID': request['requestID'],
-                                           'returncode': request['requestID'],
-                                           'type': 'commandFinished'})
-                time.sleep(.1)
+                try:
+                    request = request_socket.recv_json()
+                except zmq.error.Again:
+                    pass
+                else:
+                    if request['type'] == 'setup':
+                        continue
+                    self.last_request = request
+                    response_socket.send_json(
+                        {
+                            'requestID': request['requestID'],
+                            'returncode': request['requestID'],
+                            'out': '',
+                            'err': '',
+                            'type': 'commandFinished'
+                        }
+                    )
 
-        self._backend_alive = True
         self.handler = threading.Thread(target=handle)
 
     def tearDown(self):
-        if self.server.alive:
-            self.server._interrupted = True
-        if self.handler.is_alive():
-            self.server._request_socket.send_json({'type': 'exit'})
+        self.server.shutdown()
+        self._backend_alive = False
+        self.handler.join()
         shutil.rmtree(self.tmpdir)
-
-    def test_unavailable(self):
-        with pytest.raises(zmq.error.Again):
-            self.server.send_command(['ls'])
 
     def test_send_command(self):
         self.handler.start()
+        self.server.start()
         future = self.server.send_command(['ls'])
-        assert future.result() == 0
+        assert future.result() == (0, '', '')
         future = self.server.send_command(['blubb'])
-        assert future.result() == 1
+        assert future.result() == (1, '', '')
         self._backend_alive = False
         with pytest.raises(RuntimeError):
             future = self.server.send_command(['bla'])
