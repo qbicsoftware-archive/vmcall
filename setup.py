@@ -24,7 +24,7 @@ __location__ = os.path.join(os.getcwd(), os.path.dirname(
 # Change these settings according to your needs
 MAIN_PACKAGE = "vmcall"
 DESCRIPTION = "None"
-LICENSE = "mit"
+LICENSE = "gpl2+"
 URL = "None"
 AUTHOR = "Adrian Seyboldt"
 EMAIL = "adrian_seyboldt@web.de"
