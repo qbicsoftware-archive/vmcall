@@ -21,7 +21,7 @@ import subprocess
 
 output_dir = os.path.join(__location__, "../docs/_rst")
 module_dir = os.path.join(__location__, "../vmcall")
-cmd_line_template = "sphinx-apidoc -f -o {outputdir} {moduledir}"
+cmd_line_template = "sphinx-apidoc -M -e -f -o {outputdir} {moduledir}"
 cmd_line = cmd_line_template.format(outputdir=output_dir, moduledir=module_dir)
 subprocess.call(cmd_line, shell=True)
 
@@ -38,9 +38,9 @@ subprocess.call(cmd_line, shell=True)
 
 # Add any Sphinx extension module names here, as strings. They can be extensions
 # coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.autodoc', 'sphinx.ext.intersphinx', 'sphinx.ext.todo',
+extensions = ['sphinx.ext.autodoc', 'sphinx.ext.intersphinx',
               'sphinx.ext.autosummary', 'sphinx.ext.viewcode', 'sphinx.ext.coverage',
-              'sphinx.ext.doctest', 'sphinx.ext.ifconfig', 'sphinx.ext.pngmath']
+              'sphinx.ext.ifconfig', 'sphinx.ext.mathjax', 'sphinx.ext.napoleon']
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
