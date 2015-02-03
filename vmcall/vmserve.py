@@ -5,7 +5,7 @@ Install this service inside the VM::
     $ vmserve install
     $ vmserve start
 
-The tcp sockets *must* not be exposed to loopback on the host or even the
+The tcp sockets *must* not be exposed to loopback on the host or the
 internet. Forward them to UNIX domain sockets on the host with
 `vmcall.VMBuilder.add_command_sockets`
 """
@@ -14,13 +14,33 @@ import logging
 import time
 from concurrent import futures
 import subprocess
+import io
+import os
+import csv
+
+
+def win_label_to_path():
+    if os.name != 'nt':
+        raise NotImplementedError()
+    table_str = subprocess.check_output(
+        ['wmic', 'volume', 'get', 'DeviceID,Label', '/format:csv']
+    ).decode()
+    # first line in empty
+    table = list(csv.reader(io.StringIO(table_str)))[1:]
+    lines = [dict(zip(table[0], line)) for line in table[1:]]
+    return dict((line['Label'], line['DeviceID']) for line in lines)
 
 
 class VMSlave:
-    def __init__(self, request_path, response_path):
-        self._context = zmq.Context()
+    def __init__(self, request_path, response_path, ctx=None):
+        self._context = ctx or zmq.Context()
         self._request = self._context.socket(zmq.PULL)
         self._response = self._context.socket(zmq.PUSH)
+
+        self._request.hwm = 10
+        self._response.hwm = 10
+        self._request.set(zmq.LINGER, -1)
+        self._response.set(zmq.LINGER, -1)
 
         self._request.connect(request_path)
         self._response.connect(response_path)
@@ -34,9 +54,19 @@ class VMSlave:
         self._poller = zmq.Poller()
         self._poller.register(self._request, zmq.POLLIN)
 
+        if os.name == 'nt':
+            self._labels = win_label_to_path()
+        else:
+            self._labels = None
+
     def shutdown(self):
         """ Finish pending tasks and shutdown. """
         self._exit = True
+
+    def __del__(self):
+        self._request.close()
+        self._response.close()
+        self._context.term()
 
     def _recv_setup(self):
         """ Handle an incoming setup request.
@@ -54,11 +84,12 @@ class VMSlave:
             setup = self._request.recv_json()
             assert setup['type'] == 'setup'
             num_workers = setup['numWorkers']
+            self.info("Got setup data: %s" % setup)
+            return dict(num_workers=num_workers)
         except Exception as e:
             self.critical("Failed to interpret setup data: %s" % e)
-            self._exit()
-        self.info("Got setup data: %s" % setup)
-        return dict(num_workers=num_workers)
+            self.shutdown()
+            raise
 
     def _handle_request(self, request):
         """ Execute a request containing a command.
@@ -91,7 +122,7 @@ class VMSlave:
         with futures.ThreadPoolExecutor(setup['num_workers']) as executor:
             self._executor = executor
             while True:
-                if self._exit and not self._running_tasks:
+                if self._exit:
                     self._finish_remaining()
                     return
                 request = self._recv_request()
@@ -116,7 +147,7 @@ class VMSlave:
             self._send_finished()
             time.sleep(.01)
 
-    def _recv_request(self, timeout=100):
+    def _recv_request(self, timeout=50):
         """ Wait for `timeout` ms and return the request or `None`. """
         socks = dict(self._poller.poll(timeout))
         if socks:
@@ -129,6 +160,8 @@ class VMSlave:
             self.critical("Invalid command request: %s" % request)
             return
         command = request['command']
+        if self._labels:
+            command = [s.format(**self._labels) for s in command]
         popen = subprocess.Popen(command, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
         out, err = popen.communicate(timeout=request.get('timeout', None))
@@ -183,7 +216,7 @@ class VMSlave:
         self.log(logging.CRITICAL, message)
 
 
-def register_win_service():
+if os.name == 'nt':
     import win32serviceutil
     import win32api
 
@@ -196,13 +229,17 @@ def register_win_service():
             super().__init__(args)
 
         def SvcDoRun(self):
-            slave = VMSlave("tcp://10.0.0.3:8000", "tcp://10.0.0.3:8001")
-            slave.serve_till_exit()
+            slave = VMSlave("tcp://10.0.2.2:8000", "tcp://10.0.2.2:8001")
+            slave.serve_till_shutdown()
 
     def ctrlHandler(ctrlType):
         return True
 
-    win32api.SetConsoleHandler(ctrlHandler, True)
+
+def register_win_service():
+    if os.name != 'nt':
+        raise ValueError("Windows service is only available on windows")
+    win32api.SetConsoleCtrlHandler(ctrlHandler, True)
     win32serviceutil.HandleCommandLine(VMCallService)
 
 if __name__ == '__main__':

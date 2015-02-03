@@ -6,7 +6,7 @@ import threading
 import zmq
 import time
 
-logger = logging.getLogger('vmrun-host')
+logger = logging.getLogger('vmcall-host')
 
 
 class VMExecutor:
@@ -40,8 +40,7 @@ class VMExecutor:
         logger.info("Starting the command server")
 
         def backend_alive():
-            if self._interrupted:
-                return False
+            # do not stop the command server before the vm is started
             if not hasattr(self, '_vm_popen'):
                 return True
             return self._vm_popen.poll() is None
@@ -50,30 +49,44 @@ class VMExecutor:
             self._request_path,
             self._response_path,
             backend_alive,
+            2,
         )
-        self._command_server.start()
-
         logger.info("Starting virtual machine")
         self._vm_popen = subprocess.Popen(
-            self._command, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            self._command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        time.sleep(1)
+        if self._vm_popen.poll() is not None:
+            out, err = self._vm_popen.communicate()
+            print(out.decode())
+            print(err.decode())
+            raise RuntimeError("unexpected qemu exit")
 
-    def shutdown(self):
+        self._command_server.send_setup()
+        self._command_server.start()
+
+    def shutdown(self, force=False):
         if not hasattr(self, '_vm_popen'):
             raise ValueError(
                 "VMExecutor.shutdown was called, but vm is not running"
             )
-        logger.warn("Interrupting the virtual machine")
-        self._interrupted = True
-        self._vm_popen.kill()
+
+        self._command_server.shutdown()
+
+        if force:
+            logger.warn("Interrupting the virtual machine")
+            self._vm_popen.kill()
 
         out, err = self._vm_popen.communicate()
-        if out:
-            logger.warn('Output of qemu was "%s"', out.decode())
-        if err:
-            logger.warn('Stderr of qemu was "%s"', err.decode())
 
-        self._command_server.wait()
+        if self._vm_popen.returncode:
+            logger.error("qemu retured non-zero exit code %s",
+                         self._vm_popen.returncode)
+            if out:
+                logger.warn('Output of qemu was: %s', out)
+            if err:
+                logger.warn('Stderr of qemu was: %s', err)
+            raise RuntimeError("qemu failed")
 
     def submit(self, command):
         """ Submit the command for execution on the vm.
@@ -89,12 +102,7 @@ class VMExecutor:
         return self
 
     def __exit__(self, *args, **kwargs):
-        self._command_server.wait()
-        self.interrupt()
-        if self._vm_popen.returncode:
-            logger.error("qemu retured non-zero exit code %s",
-                         self._vm_popen.returncode)
-            raise ValueError("qemu failed")
+        self.shutdown()
         return False
 
 
@@ -145,37 +153,56 @@ class CommandSendingServer(threading.Thread):
         self._request_socket = self._context.socket(zmq.PUSH)
         self._response_socket = self._context.socket(zmq.PULL)
         self._request_socket.set(zmq.SNDTIMEO, 60000)
+
+        self._request_socket.setsockopt(zmq.LINGER, -1)
+        self._response_socket.setsockopt(zmq.LINGER, -1)
+
+        self._request_socket.hwm = 10
+        self._response_socket.hwm = 10
+
         self._request_socket.bind(request_path)
         self._response_socket.bind(response_path)
         self._backend_alive = backend_alive
 
-        self._send_lock = threading.Lock()
+        self._future_lock = threading.Lock()
 
-        self._interrupted = False
+        self._shutdown = False
 
         self._remote_logger = logging.getLogger('remote')
         self._request_counter = 0
         self._futures = {}
 
     def shutdown(self):
-        self._interrupted = True
-        self.wait()
+        """
+        Do not accept new commands and wait until all commands are finished.
+        """
+        self._shutdown = True
+        while True:
+            with self._future_lock:
+                if self._futures and (self.is_alive() or self._backend_alive()):
+                    raise ValueError("Could not finish all tasks")
+                if not self._futures:
+                    break
+            time.sleep(.1)
+
+    def __del__(self):
+        self._request_socket.close()
+        self._response_socket.close()
+        self._context.term()
+
+    def send_setup(self):
+        self._request_socket.send_json(
+            {
+                'type': 'setup',
+                'numWorkers': self._num_workers
+            }
+        )
 
     def run(self):
         try:
-            self._request_socket.send_json(
-                {
-                    'type': 'setup',
-                    'numWorkers': self._num_workers
-                }
-            )
-
             poller = zmq.Poller()
             poller.register(self._response_socket, zmq.POLLIN)
             while True:
-                if not self._backend_alive() or self._interrupted:
-                    logger.info("Shutting down CommandSendingServer")
-                    return
                 socks = dict(poller.poll(100))
                 if socks:
                     data = self._response_socket.recv_json(zmq.NOBLOCK)
@@ -183,9 +210,14 @@ class CommandSendingServer(threading.Thread):
                         self._remote_logger.log(data['priority'],
                                                 data['message'])
                     elif data['type'] == 'commandFinished':
-                        future = self._futures[data['requestID']]
-                        future._out = data
-                        del self._futures[data['requestID']]
+                        with self._future_lock:
+                            future = self._futures[data['requestID']]
+                            future._out = data
+                            del self._futures[data['requestID']]
+                elif not self._backend_alive():
+                    logger.info(
+                        "VM is dead. Shutting down CommandSendingServer")
+                    return
         except Exception as e:
             logger.critical("Exception in server thread: %s" % e)
             raise
@@ -194,8 +226,11 @@ class CommandSendingServer(threading.Thread):
         if not self.is_alive() or not self._backend_alive():
             raise RuntimeError("Tried to send message to dead server")
 
-        with self._send_lock:
+        with self._future_lock:
+            if self._shutdown:
+                raise RuntimeError("No new tasks are accepted after `finish`")
             future = VMFuture(self, command)
+            assert self._request_counter not in self._futures
             self._futures[self._request_counter] = future
             request = {
                 'type': 'command',
@@ -203,9 +238,65 @@ class CommandSendingServer(threading.Thread):
                 'requestID': self._request_counter,
             }
             self._request_counter += 1
-            self._request_socket.send_json(request)
-            return future
+        self._request_socket.send_json(request)
+        return future
 
-    def wait(self):
-        self.join()
-        return len(self._futures) == 0
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--qemu", help="qemu executable",
+                        default="qemu-system-x86_64")
+    parser.add_argument("-i", "--input", help="Input files",
+                        nargs="+", default=[])
+    parser.add_argument("image", help="vm image")
+    parser.add_argument("output", help="Path to output tar")
+    parser.add_argument("--cores", default="2")
+    parser.add_argument("--workdir", default="/tmp")
+    parser.add_argument("--insize", default="+500M")
+    parser.add_argument("--outsize", default="10G")
+
+    return parser.parse_args()
+
+
+def main():
+    import cmd
+    from .qemu import VMBuilder
+    args = parse_args()
+
+    def parse(arg):
+        return arg.split()
+
+    class RemoteShell(cmd.Cmd):
+        prompt = '$ '
+
+        def __init__(self, vm):
+            super().__init__()
+            self._vm = vm
+
+        def do_exec(self, arg):
+            future = self._vm.submit(parse(arg))
+            ret, out, err = future.result()
+            print("Exit code:", ret)
+            print("Stdout:", out)
+            print("Stderr:", err)
+
+        def do_exit(self, arg):
+            return True
+
+    with VMBuilder(args.qemu, args.image, args.workdir) as vm:
+        vm.add_diskimg('input', args.input, size=args.insize)
+        vm.add_diskimg('output', size=args.outsize)
+        vm.add_option('cpu', 'host')
+        vm.add_option('enable-kvm')
+        vm.add_option('display', 'sdl')
+        vm.add_option("m", "2G")
+        vm.add_option('smp', sockets=1, cores=args.cores, threads=2)
+        with vm.executor() as executor:
+            RemoteShell(executor).cmdloop()
+            executor.submit(['shutdown', '/t', '3']).wait()
+        vm.copy_out('output', args.output)
+
+
+if __name__ == '__main__':
+    main()

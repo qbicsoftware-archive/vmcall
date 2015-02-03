@@ -1,3 +1,4 @@
+""" Provide tools to prepare vm disk images and execute qemu. """
 from __future__ import print_function
 
 import os
@@ -11,7 +12,8 @@ from . import vmcall
 logger = logging.getLogger(__name__)
 
 
-def prepare_data_image(dest, data_dir, type='ntfs', format='raw', size='+1G'):
+def prepare_data_image(dest, data_dir, type='ntfs', format='raw',
+                       size='+1G', label=""):
     """ Create a disk image containing the data inside data_dir.
 
     Parameters
@@ -29,6 +31,8 @@ def prepare_data_image(dest, data_dir, type='ntfs', format='raw', size='+1G'):
         either the size of the whole image or if preceded by a `+`,
         the amount of free space in the final image. The size can
         be specified by appending T, G, M or K.
+    label: str
+        File system label
 
     Example
     -------
@@ -53,6 +57,7 @@ def prepare_data_image(dest, data_dir, type='ntfs', format='raw', size='+1G'):
             '--type', type,
             '--format', format,
             '--size', size,
+            '--label', label,
             '--',
             data_dir,
             dest,
@@ -161,9 +166,9 @@ class VMBuilder:
     def __init__(self, qemu_bin, root_base_image, workdir, keep_images=False):
         if not os.path.isdir(workdir):
             raise ValueError("Workdir does not exist: %s" % workdir)
-        self._workdir = workdir
+        self._workdir = tempfile.mkdtemp(dir=workdir)
 
-        image_path = pjoin(workdir, 'root_image.ovl')
+        image_path = pjoin(self._workdir, 'root_image.ovl')
         self._root_image = create_overlay(image_path, root_base_image)
         self._options = [('drive', [], {'file': self._root_image})]
         self._images = {}
@@ -214,7 +219,8 @@ class VMBuilder:
             raise ValueError("Name of image is not unique: %s" % name)
 
         if data_path is not None:
-            image = prepare_data_image(path, data_path, type, format, size)
+            image = prepare_data_image(path, data_path, type, format, size,
+                                       label=name)
         else:
             if data_files is None:
                 data_files = []
@@ -244,7 +250,7 @@ class VMBuilder:
         """
         self._options.append((name, args, kwargs))
 
-    def _add_socket(self, socket_file, host_ip, port, id_):
+    def _add_socket(self, socket_file, id_):
         """ Add socket forwarding to the command line.
 
         This socket is used to send commands to the vm and to get back
@@ -252,15 +258,14 @@ class VMBuilder:
         """
 
         self.add_option('chardev', 'socket', path=socket_file, id=id_)
-        guestfwd = "tcp:{}:{}-chardev:{}".format(host_ip, port, id_)
-        self.add_option('net', 'user', guestfwd=guestfwd, restrict='on')
 
     def _add_command_sockets(self):
         self.add_option('net', 'nic')
         self._request_path = pjoin(self._workdir, 'request-socket')
         self._response_path = pjoin(self._workdir, 'response-socket')
-        self._add_socket(self._request_path, "10.0.2.2", 8000, 'req-socket')
-        self._add_socket(self._response_path, "10.0.2.2", 8001, 'res-socket')
+        self._add_socket(self._request_path, 'req')
+        self._add_socket(self._response_path, 'res')
+        self.add_option("net", "user,restrict=on,guestfwd=tcp:10.0.2.100:8000-chardev:req,guestfwd=tcp:10.0.2.100:8001-chardev:res")
 
     def copy_out(self, image, dest, path='/'):
         """ Extract files from image. """
@@ -300,5 +305,10 @@ class VMBuilder:
     def executor(self):
         """ Start the machine and return a `VMExecutor`. """
         self._add_command_sockets()
-        return vmcall.VMExecutor(self._build_command(), self._request_path,
-                                 self._response_path)
+        command = self._build_command()
+        print(command)
+        return vmcall.VMExecutor(
+            command,
+            "ipc://" + self._request_path,
+            "ipc://" + self._response_path
+        )
